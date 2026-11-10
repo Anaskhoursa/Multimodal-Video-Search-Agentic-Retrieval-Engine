@@ -1,486 +1,192 @@
-import os
-import torch
-import numpy as np
-from typing import List, Dict, Any
-from sentence_transformers import SentenceTransformer
-from transformers import CLIPProcessor, CLIPModel
-from qdrant_client import QdrantClient
-from qdrant_client import models
+"""Multimodal dense+sparse retrieval with video-scoped filtering and RRF."""
 import logging
-from fastembed import SparseTextEmbedding
-from qdrant_client.models import Filter, FieldCondition, MatchValue
-bm25_model = SparseTextEmbedding(
-    model_name="Qdrant/bm25"
-)
+from typing import Any
+from config.config import get_settings
+
 log = logging.getLogger(__name__)
 
+
 class MultimodalRetriever:
-    def __init__(self, qdrant_host: str = "localhost", qdrant_port: int = 6333):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.client = QdrantClient(host=qdrant_host, port=qdrant_port)
-        
-        print("Initializing Retrieval Embedders on:", self.device)
-        # Load CLIP for visual search matching
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True, weights_only=False).to(self.device)
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        
-        # Load Text Embedder for speech & OCR matching
-        self.text_model = SentenceTransformer("all-MiniLM-L6-v2", device=self.device)
+    def __init__(self, qdrant_url: str | None = None, device: str | None = None,
+                 text_model: str | None = None, clip_model: str | None = None,
+                 text_embedder=None, clip_embedder=None, sparse_model=None):
+        import torch
+        from fastembed import SparseTextEmbedding
+        from sentence_transformers import SentenceTransformer
+        from transformers import CLIPModel, CLIPProcessor
+        from qdrant_client import QdrantClient, models
 
-    def _get_text_embedding(self, text: str) -> List[float]:
-        """Generates a 384-dim dense vector for transcript and OCR queries."""
-        return self.text_model.encode(text).tolist()
+        settings = get_settings()
+        requested = device or settings.device
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu") if requested == "auto" else requested
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            log.warning("CUDA requested but unavailable; falling back to CPU")
+            self.device = "cpu"
+        self.models = models
+        self.client = QdrantClient(url=qdrant_url or settings.qdrant_url)
 
-    def _get_clip_text_embedding(self, text: str) -> List[float]:
-        """Generates a 512-dim dense vector using CLIP for frame matching."""
-        inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            text_features = self.clip_model.get_text_features(**inputs)
-            # Normalize the embedding
-            text_features /= text_features.norm(dim=-1, keepdim=True)
-        return text_features[0].cpu().numpy().tolist()
-
-
-    def get_temporal_context(
-        self,
-        video_id: str,
-        center_timestamp: float,
-        window_seconds: float = 20.0
-    ) -> List[Dict]:
-        """
-        Fetches all indexed events within ±window_seconds of center_timestamp
-        across all four collections, sorted chronologically.
-
-        Returns a unified list of dicts with keys:
-            timestamp, type, text (transcript/ocr), objects (visual), ocr_text (visual)
-        """
-        window_start = max(0.0, center_timestamp - window_seconds)
-        window_end   = center_timestamp + window_seconds
-
-        context_entries = []
-
-        # ── video_frames ─────────────────────────────────────────────────────
-        try:
-            frame_points, _ = self.client.scroll(
-                collection_name="video_frames",
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="video_id",
-                            match=models.MatchValue(value=video_id)
-                        ),
-                        models.FieldCondition(
-                            key="timestamp",
-                            range=models.Range(gte=window_start, lte=window_end)
-                        ),
-                    ]
-                ),
-                limit=200,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for pt in frame_points:
-                p = pt.payload
-                context_entries.append({
-                    "timestamp": float(p.get("timestamp", 0.0)),
-                    "type":      "visual",
-                    "objects":   [o.strip() for o in p.get("detected_objects", "").split(",") if o.strip()],
-                    "ocr_text":  p.get("ocr_text") or "",
-                })
-        except Exception as e:
-            log.warning(f"get_temporal_context: video_frames scroll failed: {e}")
-
-        # ── video_transcripts ────────────────────────────────────────────────
-        try:
-            transcript_points, _ = self.client.scroll(
-                collection_name="video_transcripts",
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="video_id",
-                            match=models.MatchValue(value=video_id)
-                        ),
-                        models.FieldCondition(
-                            key="start_time",                    # transcripts use start_time
-                            range=models.Range(gte=window_start, lte=window_end)
-                        ),
-                    ]
-                ),
-                limit=100,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for pt in transcript_points:
-                p = pt.payload
-                text = p.get("text", "").strip()
-                if text:
-                    context_entries.append({
-                        "timestamp": float(p.get("start_time", 0.0)),
-                        "type":      "transcript",
-                        "text":      text,
-                    })
-        except Exception as e:
-            log.warning(f"get_temporal_context: video_transcripts scroll failed: {e}")
-
-        # ── video_ocr ────────────────────────────────────────────────────────
-        try:
-            ocr_points, _ = self.client.scroll(
-                collection_name="video_ocr",
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="video_id",
-                            match=models.MatchValue(value=video_id)
-                        ),
-                        models.FieldCondition(
-                            key="timestamp",
-                            range=models.Range(gte=window_start, lte=window_end)
-                        ),
-                    ]
-                ),
-                limit=100,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for pt in ocr_points:
-                p = pt.payload
-                text = p.get("text", "").strip()
-                if text:
-                    context_entries.append({
-                        "timestamp": float(p.get("timestamp", 0.0)),
-                        "type":      "ocr",
-                        "text":      text,
-                    })
-        except Exception as e:
-            log.warning(f"get_temporal_context: video_ocr scroll failed: {e}")
-
-        # ── video_scene_semantics ────────────────────────────────────────────
-        try:
-            semantics_points, _ = self.client.scroll(
-                collection_name="video_scene_semantics",
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="video_id",
-                            match=models.MatchValue(value=video_id)
-                        ),
-                        models.FieldCondition(
-                            key="start_time",                    # semantics use start_time
-                            range=models.Range(gte=window_start, lte=window_end)
-                        ),
-                    ]
-                ),
-                limit=100,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for pt in semantics_points:
-                p = pt.payload
-                text = p.get("semantic_text", "").strip()
-                if text:
-                    context_entries.append({
-                        "timestamp": float(p.get("start_time", 0.0)),
-                        "type":      "action",
-                        "text":      text,
-                    })
-        except Exception as e:
-            log.warning(f"get_temporal_context: video_scene_semantics scroll failed: {e}")
-
-        # ── Deduplicate and sort ─────────────────────────────────────────────
-        seen = set()
-        unique = []
-        for entry in sorted(context_entries, key=lambda x: x["timestamp"]):
-            # Deduplicate on (timestamp, type, text snippet)
-            key = (
-                round(entry["timestamp"], 1),
-                entry["type"],
-                entry.get("text", "")[:60]
-            )
-            if key not in seen:
-                seen.add(key)
-                unique.append(entry)
-
-        log.info(
-            f"get_temporal_context: video={video_id} center={center_timestamp:.1f}s "
-            f"window=±{window_seconds}s → {len(unique)} entries"
+        # Reuse the ingestion models when supplied to avoid loading a second
+        # CLIP, Sentence Transformer, and BM25 model into GPU/RAM.
+        self.text_model = text_embedder or SentenceTransformer(
+            text_model or settings.text_embedding_model, device=self.device
         )
-        return unique
+        if clip_embedder is not None:
+            self.clip_model = clip_embedder.model
+            self.clip_processor = clip_embedder.processor
+        else:
+            clip_name = clip_model or settings.clip_model
+            self.clip_model = CLIPModel.from_pretrained(clip_name).to(self.device).eval()
+            self.clip_processor = CLIPProcessor.from_pretrained(clip_name)
+        self.sparse_model = sparse_model or SparseTextEmbedding(model_name="Qdrant/bm25")
 
-    def rrf_fusion(
-        self,
-        ranked_lists: Dict[str, List[Any]],
-        k: int = 60,
-        weights: Dict[str, float] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Generic Reciprocal Rank Fusion.
+    def _text_vector(self, text: str) -> list[float]:
+        return self.text_model.encode(text, normalize_embeddings=True).tolist()
 
-        Parameters
-        ----------
-        ranked_lists:
-            {
-                "frames": [...],
-                "transcript_dense": [...],
-                "transcript_bm25": [...],
-                ...
-            }
+    def _clip_vector(self, text: str) -> list[float]:
+        import torch
+        inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+        with torch.inference_mode():
+            features = torch.nn.functional.normalize(self.clip_model.get_text_features(**inputs), dim=-1)
+        return features[0].detach().cpu().tolist()
 
-        weights:
-            Optional weight for each ranked list.
+    def _sparse_vector(self, text: str):
+        embedded = next(self.sparse_model.embed([text or "video"]))
+        return self.models.SparseVector(indices=embedded.indices.tolist(), values=embedded.values.tolist())
 
-        Returns
-        -------
-        List of fused results sorted by RRF score.
-        """
-
-        if weights is None:
-            weights = {name: 1.0 for name in ranked_lists}
-
-        fused = {}
-
-        for stream_name, results in ranked_lists.items():
-
-            stream_weight = weights.get(stream_name, 1.0)
-
+    @staticmethod
+    def rrf_fusion(ranked_lists: dict[str, list[Any]], k: int = 60,
+                   weights: dict[str, float] | None = None) -> list[dict]:
+        """Fuse raw Qdrant points or already-fused channel results."""
+        weights = weights or {}
+        fused: dict[tuple[str, float], dict] = {}
+        for stream, results in ranked_lists.items():
+            weight = weights.get(stream, 1.0)
             for rank, hit in enumerate(results, start=1):
-
-                # -------------------------------
-                # Raw Qdrant search result
-                # -------------------------------
-                if hasattr(hit, "payload"):
-
-                    payload = hit.payload
-
-                    timestamp = (
-                        payload.get("timestamp")
-                        or payload.get("start_time")
-                        or 0.0
-                    )
-
-                    key = (
-                        payload["video_id"],
-                        round(float(timestamp), 1),
-                    )
-
-                    if key not in fused:
-                        fused[key] = {
-                            "video_id": payload["video_id"],
-                            "timestamp": round(float(timestamp), 1),
-                            "rrf_score": 0.0,
-                            "matches": [],
-                        }
-
-                    fused[key]["rrf_score"] += stream_weight / (k + rank)
-
-                    fused[key]["matches"].append({
-                        "stream": stream_name,
-                        "rank": rank,
-                        "raw_score": hit.score,
+                if isinstance(hit, dict):
+                    video_id = hit.get("video_id")
+                    timestamp = round(float(hit.get("timestamp", 0.0)), 1)
+                    if not video_id:
+                        continue
+                    key = (video_id, timestamp)
+                    row = fused.setdefault(key, {
+                        "video_id": video_id, "timestamp": timestamp,
+                        "rrf_score": 0.0, "matches": [], "evidence": [],
                     })
+                    row["rrf_score"] += weight / (k + rank)
+                    row["matches"].extend(hit.get("matches", []))
+                    row["evidence"].extend(hit.get("evidence", []))
+                    continue
+                payload = getattr(hit, "payload", None) or {}
+                video_id = payload.get("video_id")
+                if not video_id:
+                    continue
+                timestamp = payload.get("timestamp")
+                if timestamp is None:
+                    timestamp = payload.get("start_time", 0.0)
+                timestamp = round(float(timestamp or 0.0), 1)
+                key = (video_id, timestamp)
+                row = fused.setdefault(key, {
+                    "video_id": video_id, "timestamp": timestamp,
+                    "rrf_score": 0.0, "matches": [], "evidence": [],
+                })
+                row["rrf_score"] += weight / (k + rank)
+                row["matches"].append({
+                    "stream": stream, "rank": rank,
+                    "raw_score": float(getattr(hit, "score", 0.0)),
+                })
+                text = payload.get("text") or payload.get("semantic_text") or payload.get("detected_objects") or payload.get("ocr_text") or ""
+                if text:
+                    row["evidence"].append({"stream": stream, "text": str(text)[:1200]})
+        return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
 
-                # -------------------------------
-                # Already-fused result
-                # -------------------------------
-                else:
-
-                    key = (
-                        hit["video_id"],
-                        round(float(hit["timestamp"]), 1),
-                    )
-
-                    if key not in fused:
-                        fused[key] = {
-                            "video_id": hit["video_id"],
-                            "timestamp": hit["timestamp"],
-                            "rrf_score": 0.0,
-                            "matches": [],
-                        }
-
-                    fused[key]["rrf_score"] += stream_weight / (k + rank)
-
-                    fused[key]["matches"].extend(hit.get("matches", []))
-
-        return sorted(
-            fused.values(),
-            key=lambda x: x["rrf_score"],
-            reverse=True,
-        )
-    def search(self, video_id: Any, query: str, limit: int = 5, weights: Dict[str, float] = None) -> List[Dict[str, Any]]:
-        if weights is None:
-            weights = {"frames": 1.2, "transcripts": 1.0, "ocr": 1.0}
-        # 1. Generate embeddings for query
-        dense_text_embedding = self._get_text_embedding(query)
-        dense_clip_embedding = self._get_clip_text_embedding(query)
-        bm25_query = next(bm25_model.embed([query]))
-        # 2. Query Qdrant collections independently
-        # Query Visual Frames
-        frame_dense = self.client.search(
-            collection_name="video_frames",
-            query_vector=("clip", dense_clip_embedding),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
+    def _search_collection(self, collection: str, dense_name: str, dense_vector: list[float],
+                           sparse, video_id: str, limit: int,
+                           dense_weight: float, sparse_weight: float) -> list[dict]:
+        models = self.models
+        query_filter = models.Filter(must=[
+            models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id))
+        ])
+        ranked: dict[str, list] = {}
+        try:
+            ranked[f"{collection}_dense"] = self.client.search(
+                collection_name=collection, query_vector=(dense_name, dense_vector),
+                query_filter=query_filter, limit=limit, with_payload=True,
             )
-        )
-        frame_sparse = self.client.search(
-            collection_name="video_frames",
-            query_vector=models.NamedSparseVector(
-                name="bm25",
-                vector=models.SparseVector(
-                    indices=bm25_query.indices,
-                    values=bm25_query.values,
-                ),
-            ),
-            limit=20,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
+        except Exception as exc:
+            log.warning("Dense search failed for %s: %s", collection, exc)
+            ranked[f"{collection}_dense"] = []
+        try:
+            ranked[f"{collection}_bm25"] = self.client.search(
+                collection_name=collection,
+                query_vector=models.NamedSparseVector(name="bm25", vector=sparse),
+                query_filter=query_filter, limit=limit, with_payload=True,
             )
-            
-        )
-        
-        frames_results = self.rrf_fusion(
-            ranked_lists={
-                "frames_clip": frame_dense,
-                "frames_bm25": frame_sparse,
-            },
-            weights={
-                "frames_clip": 1.2,
-                "frames_bm25": 1.0,
-            },
-        )
+        except Exception as exc:
+            log.warning("Sparse search failed for %s: %s", collection, exc)
+            ranked[f"{collection}_bm25"] = []
+        return self.rrf_fusion(ranked, weights={
+            f"{collection}_dense": dense_weight,
+            f"{collection}_bm25": sparse_weight,
+        })
 
-        # Query Spoken Transcripts
-        transcripts_dense = self.client.search(
-            collection_name="video_transcripts",
-            query_vector=("dense", dense_text_embedding),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )
-        )
-        transcripts_bm25 = self.client.search(
-            collection_name="video_transcripts",
-            query_vector=models.NamedSparseVector(
-                name="bm25",
-                vector=models.SparseVector(
-                    indices=bm25_query.indices,
-                    values=bm25_query.values,
-                ),
-            ),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )
-        )
-        transcripts_results = self.rrf_fusion(
-            ranked_lists={
-                "transcripts_dense": transcripts_dense,
-                "transcripts_bm25": transcripts_bm25,
-            },
-            weights={
-                "transcripts_dense": 1.0,
-                "transcripts_bm25": 1.2,
-            },
-        )
-        # Query On-Screen OCR
-        ocr_dense = self.client.search(
-            collection_name="video_ocr",
-            query_vector=("dense", dense_text_embedding),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )
-        )
-        ocr_bm25 = self.client.search(
-            collection_name="video_ocr",
-            query_vector=models.NamedSparseVector(
-                name="bm25",
-                vector=models.SparseVector(
-                    indices=bm25_query.indices,
-                    values=bm25_query.values,
-                ),
-            ),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )            
-        )
+    def search(self, video_id: str, query: str, limit: int = 5,
+               weights: dict[str, float] | None = None) -> list[dict]:
+        if not video_id or not query or not query.strip():
+            return []
+        limit = max(1, min(int(limit), 100))
+        dense_text = self._text_vector(query)
+        dense_clip = self._clip_vector(query)
+        sparse = self._sparse_vector(query)
+        channel_weights = weights or {"frames": 1.2, "transcripts": 1.0, "ocr": 1.0, "actions": 1.4}
+        channel_results = {
+            "frames": self._search_collection("video_frames", "clip", dense_clip, sparse, video_id, limit * 2, 1.2, 1.0),
+            "transcripts": self._search_collection("video_transcripts", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
+            "ocr": self._search_collection("video_ocr", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
+            "actions": self._search_collection("video_scene_semantics", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
+        }
+        return self.rrf_fusion(channel_results, weights=channel_weights)[:limit]
 
-        ocr_results = self.rrf_fusion(
-            ranked_lists={
-                "ocr_dense": ocr_dense,
-                "ocr_bm25": ocr_bm25,
-            },
-            weights={
-                "ocr_dense": 1.0,
-                "ocr_bm25": 1.2,
-            }
-        )
-        
-                # Query On-Screen OCR
-        actions_dense = self.client.search(
-            collection_name="video_scene_semantics",
-            query_vector=("dense", dense_text_embedding),
-            limit=limit * 2,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )            
-        )
-        actions_bm25 = self.client.search(
-            collection_name="video_scene_semantics",
-            query_vector=models.NamedSparseVector(
-                name="bm25",
-                vector=models.SparseVector(
-                    indices=bm25_query.indices,
-                    values=bm25_query.values,
-                ),
-            ),
-            limit=limit * 2,
-             query_filter=Filter(
-                must=[
-                    FieldCondition(key="video_id", match=MatchValue(value=video_id))
-                ]
-            )           
-        )
+    def get_temporal_context(self, video_id: str, center_timestamp: float,
+                             window_seconds: float = 20.0) -> list[dict]:
+        models = self.models
+        start = max(0.0, float(center_timestamp) - max(0.0, window_seconds))
+        end = float(center_timestamp) + max(0.0, window_seconds)
+        entries: list[dict] = []
+        specs = [
+            ("video_frames", "timestamp", "visual"),
+            ("video_transcripts", "start_time", "transcript"),
+            ("video_ocr", "timestamp", "ocr"),
+            ("video_scene_semantics", "start_time", "action"),
+        ]
+        for collection, time_field, kind in specs:
+            try:
+                points, _ = self.client.scroll(
+                    collection_name=collection,
+                    scroll_filter=models.Filter(must=[
+                        models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id)),
+                        models.FieldCondition(key=time_field, range=models.Range(gte=start, lte=end)),
+                    ]),
+                    limit=500, with_payload=True, with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    timestamp = float(payload.get(time_field, 0.0))
+                    if kind == "visual":
+                        text = ", ".join(filter(None, [
+                            str(payload.get("detected_objects") or ""),
+                            str(payload.get("ocr_text") or ""),
+                        ]))
+                    else:
+                        text = str(payload.get("text") or payload.get("semantic_text") or "")
+                    if text.strip():
+                        entries.append({"timestamp": timestamp, "type": kind, "text": text.strip()[:2000]})
+            except Exception as exc:
+                log.warning("Temporal context read failed (%s): %s", collection, exc)
+        unique = {}
+        for entry in entries:
+            key = (round(entry["timestamp"], 1), entry["type"], entry["text"][:100])
+            unique[key] = entry
+        return sorted(unique.values(), key=lambda item: item["timestamp"])
 
-        actions_results = self.rrf_fusion(
-            ranked_lists={
-                "actions_dense": actions_dense,
-                "actions_bm25": actions_bm25,
-            },
-            weights={
-                "actions_dense": 1.0,
-                "actions_bm25": 1.2,
-            }
-        )
-        
-        final_results = self.rrf_fusion(
-            ranked_lists={
-                "frames": frames_results,
-                "transcripts": transcripts_results,
-                "ocr": ocr_results,
-                "actions": actions_results
-            },
-            weights={
-                "frames": 1.2,
-                "transcripts": 1.0,
-                "ocr": 1.0,
-                "actions": 1.4
-            },
-        )
-
-        return final_results[:limit]
+    def close(self):
+        self.client.close()

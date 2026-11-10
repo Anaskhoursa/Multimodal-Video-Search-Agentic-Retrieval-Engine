@@ -1,86 +1,49 @@
+"""Video action recognition using a bounded 16-frame sample."""
 from pathlib import Path
-from typing import List
-import torch
-
-from transformers import (
-    VideoMAEImageProcessor,
-    VideoMAEForVideoClassification
-)
 import av
+import logging
+import numpy as np
+import torch
+from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
+from config.config import get_settings
+
+log = logging.getLogger(__name__)
 
 
 class SceneRecognizer:
-
-    def __init__(
-        self,
-        model_name="MCG-NJU/videomae-base-finetuned-kinetics"
-    ):
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    def __init__(self, model_name: str = "MCG-NJU/videomae-base-finetuned-kinetics"):
+        requested = get_settings().device
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu") if requested == "auto" else requested
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            self.device = "cpu"
         self.processor = VideoMAEImageProcessor.from_pretrained(model_name)
+        self.model = VideoMAEForVideoClassification.from_pretrained(model_name).to(self.device).eval()
 
-        self.model = (
-            VideoMAEForVideoClassification
-            .from_pretrained(model_name)
-            .to(self.device)
-        )
-
-        self.model.eval()
-
-    def recognize_actions(
-        self,
-        video_path: str,
-        top_k: int = 5
-    ) -> List[str]:
-
-        frames = self._load_video(video_path)
-
-        inputs = self.processor(
-            frames,
-            return_tensors="pt"
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        probs = outputs.logits.softmax(-1)
-
-        values, indices = probs.topk(top_k)
-
-        labels = []
-
-        for idx in indices[0]:
-            labels.append(
-                self.model.config.id2label[idx.item()]
-            )
-
-        return labels
-
-    def _load_video(self, path: str) -> List:
-            import numpy as np
-            
-            container = av.open(path)
+    def _load_video(self, path: str | Path) -> list:
+        frames = []
+        with av.open(str(path)) as container:
             stream = container.streams.video[0]
-            
-            # 1. Read all raw frames from the video container chunk
-            all_frames = []
-            for frame in container.decode(video=0):
-                all_frames.append(frame.to_image())
-                
-            container.close()
-            
-            total_frames = len(all_frames)
-            
-            # Fallback if the video segment contains no readable frames
-            if total_frames == 0:
-                raise ValueError(f"No video frames could be decoded from path: {path}")
-                
-            # 2. Uniformly sample exactly 16 frame indices across the sequence duration
-            target_frame_count = 16
-            indices = np.linspace(0, total_frames - 1, num=target_frame_count, dtype=int)
-            
-            # 3. Pull out just those 16 target frames
-            sampled_frames = [all_frames[idx] for idx in indices]
-            
-            return sampled_frames
+            total = stream.frames or 0
+            if total:
+                targets = set(np.linspace(0, max(total - 1, 0), 16, dtype=int).tolist())
+                for index, frame in enumerate(container.decode(video=0)):
+                    if index in targets:
+                        frames.append(frame.to_image().convert("RGB"))
+            else:
+                decoded = [frame.to_image().convert("RGB") for frame in container.decode(video=0)]
+                if decoded:
+                    indices = np.linspace(0, len(decoded) - 1, min(16, len(decoded)), dtype=int)
+                    frames = [decoded[index] for index in indices]
+        if not frames:
+            raise ValueError(f"No video frames could be decoded from {path}")
+        if len(frames) < 16:
+            frames.extend([frames[-1]] * (16 - len(frames)))
+        return frames[:16]
+
+    def recognize_actions(self, video_path: str | Path, top_k: int = 5) -> list[str]:
+        frames = self._load_video(video_path)
+        inputs = self.processor(frames, return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            logits = self.model(**inputs).logits
+            indices = logits.softmax(-1).topk(min(top_k, logits.shape[-1])).indices[0]
+        return [self.model.config.id2label[index.item()] for index in indices]

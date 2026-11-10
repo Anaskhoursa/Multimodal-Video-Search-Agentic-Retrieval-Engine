@@ -1,53 +1,49 @@
-import os
-import subprocess
+"""Speech transcription and sentence-transformer embeddings."""
 from pathlib import Path
-from typing import List, Dict, Any
+import subprocess
+import logging
+import torch
 from faster_whisper import WhisperModel
 from sentence_transformers import SentenceTransformer
+from config.config import get_settings
+
+log = logging.getLogger(__name__)
+
 
 class AudioProcessor:
-    def __init__(self, whisper_model_size: str = "base", device: str = "cuda"):
-        """
-        Initializes Faster-Whisper and a text embedder on the specified hardware (cuda/cpu).
-        """
-        print(f"Initializing Faster-Whisper ({whisper_model_size}) on device: {device}")
-        # compute_type="float16" forces efficient GPU processing. Swap to "int8" if low on VRAM.
-        self.whisper = WhisperModel(whisper_model_size, device=device, compute_type="int8")
-        
-        print(f"Initializing Text Embedder (all-MiniLM-L6-v2) on device: {device}")
-        self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+    def __init__(self, whisper_model_size: str = "base", device: str = "auto",
+                 text_model: str | None = None):
+        settings = get_settings()
+        selected = device if device != "auto" else settings.device
+        if selected == "auto":
+            selected = "cuda" if torch.cuda.is_available() else "cpu"
+        if selected.startswith("cuda") and not torch.cuda.is_available():
+            log.warning("CUDA requested but unavailable; using CPU for audio models")
+            selected = "cpu"
+        self.device = selected
+        compute_type = "float16" if self.device.startswith("cuda") else "int8"
+        self.whisper = WhisperModel(whisper_model_size, device=self.device, compute_type=compute_type)
+        self.embedder = SentenceTransformer(text_model or settings.text_embedding_model, device=self.device)
 
     def extract_audio_from_chunk(self, video_chunk_path: Path, output_audio_path: Path) -> bool:
-        """Rips raw 16kHz mono audio track from an MP4 chunk for Whisper."""
+        output_audio_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
-            "ffmpeg", "-y", "-i", str(video_chunk_path),
-            "-vn",                  # Disable video recording stream
-            "-acodec", "pcm_s16le", # Convert audio to linear PCM 16-bit
-            "-ar", "16000",         # Set audio sample rate to 16kHz (Whisper native)
-            "-ac", "1",             # Reduce to 1 audio channel (mono)
-            str(output_audio_path)
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_chunk_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(output_audio_path),
         ]
-        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            output_audio_path.unlink(missing_ok=True)
+            log.debug("No extractable audio in %s: %s", video_chunk_path, result.stderr[-500:])
+            return False
+        return True
 
-    def transcribe_and_embed(self, audio_path: Path) -> Dict[str, Any]:
-        """Transcribes the audio chunk and generates its semantic text embedding."""
-        if not audio_path.exists():
+    def transcribe_and_embed(self, audio_path: Path) -> dict:
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
             return {"text": "", "embedding": []}
-
-        # Transcribe audio file
-        segments, info = self.whisper.transcribe(str(audio_path), beam_size=5)
-        
-        # Combine all sentence segments found in this chunk into one unified block
-        text_content = " ".join([seg.text for seg in segments]).strip()
-        
-        if not text_content:
+        segments, _ = self.whisper.transcribe(str(audio_path), beam_size=5, vad_filter=True)
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        if not text:
             return {"text": "", "embedding": []}
-
-        # Generate a mathematical vector for this text string (returns a 384-dimensional array)
-        embedding = self.embedder.encode(text_content).tolist()
-        
-        return {
-            "text": text_content,
-            "embedding": embedding
-        }
+        embedding = self.embedder.encode(text, normalize_embeddings=True).tolist()
+        return {"text": text, "embedding": embedding}

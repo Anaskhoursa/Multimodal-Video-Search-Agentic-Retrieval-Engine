@@ -1,56 +1,36 @@
-import os
-import torch
-import urllib.request
+"""YOLO object detection with automatic CPU/GPU selection."""
 from pathlib import Path
-from typing import List, Dict, Any
-from ultralytics import YOLOv10
+import logging
+import torch
+from ultralytics import YOLO
+from config.config import get_settings
+
+log = logging.getLogger(__name__)
+
 
 class ObjectDetector:
-    def __init__(self, model_version: str = "yolov10n", device: str = "cuda"):
-        """
-        Initializes YOLOv10. Auto-downloads weights if missing in working directory.
-        """
-        self.device = device if torch.cuda.is_available() else "cpu"
-        
-        # Verify weight file exists, download if missing
-        model_filename = f"{model_version}.pt"
-        self.model_path = Path(model_filename)
-        
-        if not self.model_path.exists():
-            print(f"[{model_version}] weights not found locally. Initiating download...")
-            download_url = f"https://github.com/THU-MIG/yolov10/releases/download/v1.1/{model_filename}"
-            try:
-                urllib.request.urlretrieve(download_url, self.model_path)
-                print(f"[{model_version}] Weight file successfully saved to {self.model_path.absolute()}")
-            except Exception as e:
-                raise RuntimeError(f"Failed to download YOLOv10 weights from {download_url}. Error: {e}")
+    def __init__(self, model_version: str | None = None, device: str = "auto"):
+        settings = get_settings()
+        requested = device if device != "auto" else settings.device
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu") if requested == "auto" else requested
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            log.warning("CUDA requested but unavailable; using CPU for object detection")
+            self.device = "cpu"
+        self.model_path = model_version or settings.yolo_model
+        self.model = YOLO(self.model_path)
 
-        print(f"Initializing YOLOv10 ({model_version}) on device: {self.device}")
-        self.model = YOLOv10(str(self.model_path)).to(self.device)
-
-    def detect_objects(self, image_path: str, confidence_threshold: float = 0.25) -> List[Dict[str, Any]]:
-        """
-        Runs object detection on a target frame.
-        """
-        results = self.model(image_path, conf=confidence_threshold, verbose=False)
-        detections = []
-        
+    def detect_objects(self, image_path: str | Path, confidence_threshold: float = 0.3) -> list[dict]:
+        results = self.model.predict(source=str(image_path), conf=confidence_threshold,
+                                     device=self.device, verbose=False)
         if not results:
-            return detections
-            
+            return []
         result = results[0]
-        names = result.names
-        
-        for box in result.boxes:
+        detections = []
+        for box in result.boxes or []:
             class_id = int(box.cls[0].item())
-            class_name = names[class_id]
-            confidence = float(box.conf[0].item())
-            xyxy = box.xyxy[0].tolist()  # [xmin, ymin, xmax, ymax]
-            
             detections.append({
-                "object": class_name,
-                "confidence": round(confidence, 3),
-                "box": [round(coord, 1) for coord in xyxy]
+                "object": result.names[class_id],
+                "confidence": round(float(box.conf[0].item()), 3),
+                "box": [round(float(value), 1) for value in box.xyxy[0].tolist()],
             })
-            
         return detections

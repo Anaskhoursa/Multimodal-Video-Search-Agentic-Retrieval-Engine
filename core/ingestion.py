@@ -1,208 +1,105 @@
-import os
-import subprocess
-import shutil
+"""FFmpeg-backed video preparation with bounded, timestamped scene chunks."""
 from pathlib import Path
-import subprocess
+import logging
 import re
-from pathlib import Path
-from typing import List, Tuple
-import numpy as np
+import subprocess
+
+log = logging.getLogger(__name__)
+
 
 class VideoIngestionPipeline:
-    def __init__(self, base_storage_dir: str):
+    def __init__(self, base_storage_dir: str, max_chunk_seconds: float = 30.0):
         self.base_dir = Path(base_storage_dir)
         self.raw_dir = self.base_dir / "raw"
         self.processed_dir = self.base_dir / "processed"
-        
-        # Ensure workspace directories exist
+        self.max_chunk_seconds = max(5.0, float(max_chunk_seconds))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
-    def create_video_workspace(self, video_id: str) -> dict:
-        """Creates specialized subdirectories for a specific video processing job."""
-        video_workspace = self.processed_dir / video_id
-        paths = {
-            "workspace": video_workspace,
-            "chunks": video_workspace / "chunks",
-            "frames": video_workspace / "frames",
-            "audio": video_workspace / "audio"
-        }
+    def create_video_workspace(self, video_id: str) -> dict[str, Path]:
+        root = self.processed_dir / video_id
+        paths = {"workspace": root, "chunks": root / "chunks",
+                 "frames": root / "frames", "audio": root / "audio"}
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         return paths
 
-    def extract_audio(self, video_path: Path, output_audio_path: Path) -> bool:
-        """Strips audio channel from video and converts it to a clean WAV format for Whisper."""
-        command = [
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vn", # Disable video recording
-            "-acodec", "pcm_s16le", # Convert to 16-bit PCM uncompressed WAV
-            "-ar", "16000", # Resample to 16kHz (Optimal for speech models like Whisper)
-            "-ac", "1", # Downmix to mono channel
-            str(output_audio_path)
-        ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return result.returncode == 0
+    @staticmethod
+    def _run(command: list[str]) -> subprocess.CompletedProcess:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError("FFmpeg and FFprobe must be installed and available on PATH.") from exc
+        if result.returncode != 0:
+            raise RuntimeError(f"Command failed ({command[0]}): {result.stderr[-2000:]}")
+        return result
 
-    def extract_frames(self, video_path: Path, output_frame_dir: Path, fps: float = 1.0) -> bool:
-        """Extracts keyframes at a specific Frame Per Second (FPS) rate for CLIP analysis."""
-        command = [
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vf", f"fps={fps}", # Video filter option: set frame rate extraction
-            f"{output_frame_dir}/frame_%04d.jpg" # Output naming pattern (e.g. frame_0001.jpg)
-        ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return result.returncode == 0
+    def duration(self, video_path: Path) -> float:
+        result = self._run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video_path),
+        ])
+        try:
+            duration = float(result.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError("Could not read video duration.") from exc
+        if duration <= 0:
+            raise RuntimeError("The uploaded video has no playable duration.")
+        return duration
 
+    def _scene_boundaries(self, video_path: Path, duration: float,
+                          threshold: float = 0.4) -> list[float]:
+        # select(scene) emits showinfo only for selected scene-change frames.
+        # Parsing all metadata frames (the previous implementation) created a
+        # boundary at almost every frame and exploded the number of clips.
+        try:
+            result = self._run([
+                "ffmpeg", "-hide_banner", "-i", str(video_path),
+                "-vf", f"select='gt(scene,{threshold})',showinfo",
+                "-an", "-f", "null", "-",
+            ])
+            points = [0.0]
+            for match in re.finditer(r"pts_time:([0-9.]+)", result.stderr):
+                point = float(match.group(1))
+                if 0 < point < duration:
+                    points.append(point)
+            return sorted(set(points + [duration]))
+        except (RuntimeError, ValueError) as exc:
+            log.warning("Scene detection failed; using fixed chunks: %s", exc)
+            return [0.0, duration]
 
+    def chunk_video(self, video_path: Path, output_chunk_dir: Path,
+                    output_frame_dir: Path, threshold: float = 0.4) -> list[tuple[float, float]]:
+        output_chunk_dir.mkdir(parents=True, exist_ok=True)
+        output_frame_dir.mkdir(parents=True, exist_ok=True)
+        duration = self.duration(video_path)
+        boundaries = self._scene_boundaries(video_path, duration, threshold)
+        segments: list[tuple[float, float]] = []
+        for left, right in zip(boundaries, boundaries[1:]):
+            cursor = left
+            while cursor < right:
+                end = min(right, cursor + self.max_chunk_seconds)
+                if end - cursor < 0.25:
+                    break
+                segments.append((cursor, end))
+                cursor = end
+        if not segments:
+            segments = [(0.0, duration)]
 
-    def chunk_video(self, video_path: Path, output_chunk_dir: Path, output_frame_dir: Path, threshold: float = 0.4) -> List[Tuple[float, float]]:
-        timestamp_file = output_chunk_dir / "timestamps.txt"
-        
-        # STEP 1: Detect scene changes
-        detect_command = [
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vf", f"scdet=s=1,metadata=print:file={timestamp_file.as_posix()}",
-            "-an",
-            "-f", "null", "-"
-        ]
-        result = subprocess.run(
-            detect_command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
-
-        # STEP 2: Parse timestamps
-        timestamps = [0.0]
-        if timestamp_file.exists():
-            with open(timestamp_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if "pts_time:" in line:
-                        try:
-                            time_str = line.split("pts_time:")[1].strip().split()[0]
-                            val = round(float(time_str), 2)
-                            if val > 0.0 and val not in timestamps:
-                                timestamps.append(val)
-                        except (IndexError, ValueError):
-                            continue
-            timestamp_file.unlink()
-        else:
-            print("WARNING: timestamp file not found. FFmpeg stderr:")
-            print(result.stderr.decode())
-
-        # STEP 3: Get total duration
-        duration_cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path)
-        ]
-        total_duration = round(float(subprocess.check_output(duration_cmd).decode().strip()), 2)
-        timestamps.append(total_duration)
-        timestamps = sorted(list(set(timestamps)))
-
-        # STEP 4: Merge very short chunks (< 2 seconds)
-        merged = [timestamps[0]]
-        for t in timestamps[1:]:
-            if t - merged[-1] >= 2.0:
-                merged.append(t)
-        merged[-1] = total_duration
-        timestamps = merged
-        
-        from core.detector import ObjectDetector
-
-        # Initialize once (outside the scene loop)
-        detector = ObjectDetector()
-
-        frames_dir = output_frame_dir
-        frames_dir.mkdir(exist_ok=True)
-
-        scene_segments = []
-
-        for i in range(len(timestamps) - 1):
-            start = timestamps[i]
-            end = timestamps[i + 1]
-            duration = end - start
-            scene_segments.append((start, end))
-
-            # ---------------- Slice scene ---------------- #
-            output_path = output_chunk_dir / f"scene_{start:.2f}_to_{end:.2f}.mp4"
-
-            slice_command = [
-                "ffmpeg", "-y",
-                "-ss", str(start),
-                "-to", str(end),
-                "-i", str(video_path),
-                "-c", "copy",
-                str(output_path)
-            ]
-            subprocess.run(slice_command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL)
-
-            # ---------------- Sample timestamps ---------------- #
-
-            sample_interval = min(2.0, max(0.5, duration / 20))
-
-            sample_points = np.arange(start, end, sample_interval).tolist()
-
-            if len(sample_points) == 0:
-                sample_points = [start]
-
-            previous_objects = None
-            saved_idx = 0
-
-            for ts in sample_points:
-
-                temp_frame = frames_dir / "__temp.jpg"
-
-                extract_command = [
-                    "ffmpeg", "-y",
-                    "-ss", str(round(ts, 3)),
-                    "-i", str(video_path),
-                    "-frames:v", "1",
-                    "-q:v", "2",
-                    str(temp_frame)
-                ]
-
-                subprocess.run(
-                    extract_command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-
-                detections = detector.detect_objects(str(temp_frame))
-
-                current_objects = {
-                    d["object"]
-                    for d in detections
-                }
-
-                # Save first frame of every scene
-                should_save = previous_objects is None
-
-                # Save whenever object set changes
-                if previous_objects is not None:
-                    if current_objects != previous_objects:
-                        should_save = True
-
-                if should_save:
-
-                    frame_filename = (
-                        f"chunk_{start:.2f}_{end:.2f}_frame{saved_idx}.jpg"
-                    )
-
-                    final_path = frames_dir / frame_filename
-
-                    os.replace(temp_frame, final_path)
-
-                    saved_idx += 1
-
-                    previous_objects = current_objects
-
-                else:
-                    temp_frame.unlink(missing_ok=True)
-
-        print(f"Created {len(scene_segments)} scene chunks.")
-        print(f"Keyframes saved to: {frames_dir}")
-        return scene_segments
+        for start, end in segments:
+            stem = f"scene_{start:.2f}_to_{end:.2f}"
+            chunk_path = output_chunk_dir / f"{stem}.mp4"
+            self._run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start:.3f}", "-i", str(video_path),
+                "-t", f"{end - start:.3f}", "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-movflags", "+faststart", str(chunk_path),
+            ])
+            pattern = output_frame_dir / f"{stem}_frame%03d.jpg"
+            self._run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(chunk_path), "-vf", "fps=0.5", "-q:v", "3", str(pattern),
+            ])
+        log.info("Prepared %d scene chunks and timestamped frames for %s", len(segments), video_path.name)
+        return segments

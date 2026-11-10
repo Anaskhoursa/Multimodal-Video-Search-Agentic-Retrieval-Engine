@@ -1,295 +1,283 @@
 # Multimodal Video Search & Agentic Retrieval Engine
 
-An experimental video-understanding backend that turns uploaded videos into searchable, timestamped multimodal evidence. Instead of searching only subtitles or filenames, it indexes visual frames, detected objects, on-screen text, spoken words, and scene-level action labels, then retrieves relevant moments for natural-language questions.
+A video-understanding backend that indexes **what appears, what is written, what is spoken, and what actions occur** in a video. Ask natural-language questions and receive answers grounded in retrieved evidence with timestamps.
 
-> **Project status:** This README describes the code currently present on the `main` branch. The repository is an evolving prototype. In particular, the chat integration, dependency manifest, and Docker setup have gaps documented below; the README does not imply that every advertised path is production-ready.
+The service is built with FastAPI, FFmpeg, CLIP, YOLO, EasyOCR, Faster-Whisper, Sentence Transformers, VideoMAE, Qdrant, and Ollama.
+
+> **Project status:** The repository now includes a consistent ingestion/retrieval/chat implementation, environment-based configuration, tests for core logic, and a Docker setup. The complete GPU/model pipeline still needs to be exercised on a machine with FFmpeg, Qdrant, model access, and (optionally) CUDA. The automated unit tests do not prove that every third-party model downloads or runs on every hardware configuration.
+
+---
 
 ## Contents
 
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
-- [How the pipeline works](#how-the-pipeline-works)
-- [Retrieval and ranking](#retrieval-and-ranking)
-- [Conversational layer](#conversational-layer)
-- [Repository tour](#repository-tour)
-- [Technology stack](#technology-stack)
-- [Requirements and setup](#requirements-and-setup)
-- [Running the API](#running-the-api)
+- [How a video is processed](#how-a-video-is-processed)
+- [How search and chat work](#how-search-and-chat-work)
+- [Models and vector collections](#models-and-vector-collections)
+- [Repository structure](#repository-structure)
+- [Requirements](#requirements)
+- [Run locally](#run-locally)
+- [Run with Docker Compose](#run-with-docker-compose)
 - [API reference](#api-reference)
-- [Storage layout](#storage-layout)
-- [Current implementation notes](#current-implementation-notes)
-- [Potential next steps](#potential-next-steps)
+- [Configuration](#configuration)
+- [Tests](#tests)
+- [Operational notes and limitations](#operational-notes-and-limitations)
 
 ## What it does
 
-The system is designed to answer questions such as:
-
-- "When does a person enter the room?"
-- "Find the part where a car appears."
-- "What does the slide say?"
-- "Where is the speaker discussing the database?"
-- "What action is happening around the middle of the video?"
-
-The intended workflow is:
-
-1. Upload a video through the FastAPI endpoint.
-2. Split the video into scenes and representative frames.
-3. Extract and transcribe its audio.
-4. Analyze frames for visual content and text.
-5. Convert the extracted information into dense and sparse vectors.
-6. Store the vectors and metadata in Qdrant, keyed by a video ID.
-7. Search the indexed evidence and use a local LLM to formulate a timestamp-grounded answer.
-
-The project combines several complementary signals:
-
-| Signal | What is extracted | Main implementation |
-|---|---|---|
-| Visual appearance | CLIP image embeddings for sampled frames | `core/embedder.py` |
-| Objects | Object labels, confidence values, and bounding boxes | `core/detector.py` |
-| On-screen text | Text detected in frames | `core/ocr.py` |
-| Spoken content | Speech transcripts and text embeddings | `core/audio_processor.py` |
-| Scene/action semantics | Video-level action labels | `core/scene.py` |
+1. Accepts an uploaded video and assigns it a unique `video_id`.
+2. Detects scene changes and splits long scenes into manageable clips.
+3. Samples frames and extracts visual, object, and OCR features.
+4. Transcribes speech and creates semantic embeddings.
+5. Optionally predicts action labels for each clip.
+6. Stores dense and sparse vectors in separate Qdrant collections.
+7. Plans a natural-language search query with a local Ollama model (with a fallback if Ollama is unavailable).
+8. Retrieves evidence only from the requested video, combines ranked results with Reciprocal Rank Fusion (RRF), and asks Ollama to produce a timestamp-grounded answer.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    A[Client uploads video] --> B[FastAPI /ingest]
-    B --> C[Save raw video and queue background task]
-    C --> D[FFmpeg scene detection and chunking]
-    D --> E[Keyframe sampling]
-    D --> F[Audio extraction and silence-aware splitting]
-    E --> G[CLIP image embeddings]
-    E --> H[YOLO object detection]
-    E --> I[EasyOCR text extraction]
-    F --> J[Faster-Whisper transcription]
-    D --> K[VideoMAE action recognition]
-    G --> L[Qdrant vector collections]
-    H --> L
-    I --> L
-    J --> L
-    K --> L
-    M[Natural-language question] --> N[Retrieval layer]
-    L --> N
-    N --> O[Ranked timestamped evidence]
-    O --> P[Ollama / Llama 3 chat layer]
-    P --> Q[Answer with timestamp references]
+    U[Client] --> API[FastAPI]
+    API --> UP[Upload and job status]
+    UP --> FF[FFmpeg scene detection and clip extraction]
+    FF --> FR[Sampled frames]
+    FF --> AU[Audio tracks per clip]
+    FR --> CLIP[CLIP image embeddings]
+    FR --> YOLO[YOLO object detection]
+    FR --> OCR[EasyOCR text extraction]
+    AU --> WH[Whisper transcription]
+    CLIP --> QF[(Qdrant video_frames)]
+    YOLO --> QF
+    OCR --> QO[(Qdrant video_ocr)]
+    WH --> QT[(Qdrant video_transcripts)]
+    FF --> VM[VideoMAE action labels]
+    VM --> QS[(Qdrant video_scene_semantics)]
+    C[Chat request] --> PLAN[Ollama query planner]
+    PLAN --> RET[Video-scoped dense + sparse retrieval]
+    QF --> RET
+    QO --> RET
+    QT --> RET
+    QS --> RET
+    RET --> RRF[Reciprocal Rank Fusion]
+    RRF --> CTX[Timestamped evidence context]
+    CTX --> LLM[Ollama answer generation]
+    LLM --> API
 ```
 
-### Main components
+## How a video is processed
 
-- **FastAPI (`main.py`)** exposes video ingestion and video-chat endpoints and initializes the models during application startup.
-- **Video processing (`core/ingestion.py` and the ingestion worker in `main.py`)** creates per-video workspaces, finds scene boundaries, extracts frames, and prepares audio.
-- **Multimodal encoders** represent images and text as vectors. CLIP is used for visual similarity; Sentence Transformers is used for transcript/OCR/action text; FastEmbed's Qdrant BM25 model produces sparse lexical vectors.
-- **Qdrant (`core/vector_db.py`)** stores vectors with payload metadata such as video ID, timestamp, frame/chunk name, and extracted text.
-- **Retrieval (`core/retriever.py`)** searches the visual, transcript, OCR, and scene-semantics collections and fuses ranked results.
-- **Local LLM (`core/chat_engine.py`, Ollama)** is intended to turn retrieved evidence into a conversational answer.
+### 1. Upload and workspace creation
 
-## How the pipeline works
+`POST /ingest` accepts an MP4, AVI, MOV, MKV, or WebM file. The server streams it to a UUID-named file under `storage/raw/`, enforces `MAX_UPLOAD_BYTES`, then schedules a background ingestion task.
 
-### 1. Upload and job creation
+Each video gets a workspace:
 
-`POST /ingest` accepts an MP4, AVI, MOV, or MKV file. The API creates a UUID for the video, saves the original file under `storage/raw/`, and schedules `run_background_ingestion` as a FastAPI background task. The response contains the `video_id` that identifies the indexed video.
+```text
+storage/
+├── raw/                         # temporary upload; deleted after processing
+└── processed/
+    └── <video_id>/
+        ├── chunks/              # timestamped scene clips
+        ├── frames/              # sampled JPEG frames
+        └── audio/
+            └── transcripts/
+                └── transcript.json
+```
 
-### 2. Workspace and audio preparation
+### 2. Scene detection and chunking
 
-The ingestion pipeline creates a workspace under `storage/processed/<video_id>/` with folders for chunks, frames, and audio. FFmpeg extracts a 16 kHz, mono WAV audio track. Scene boundaries are detected with FFmpeg's `scdet` filter and metadata timestamps; very short intervals are merged before scene clips are written.
+`core/ingestion.py` uses FFmpeg's scene-selection filter to identify scene boundaries. It parses only frames selected by the scene filter (rather than treating every frame's metadata as a scene boundary), then subdivides long scenes so no clip exceeds `MAX_VIDEO_CHUNK_SECONDS`.
 
-The worker also applies a silence-aware post-processing step to long scene clips. It tries to split clips at detected pauses, with a 45-second maximum target chunk length and fixed-window fallback when no suitable pause is found.
+Each clip is written as:
 
-### 3. Frame sampling and visual analysis
+`scene_<start>_to_<end>.mp4`
 
-For each scene, the pipeline samples timestamps at an interval derived from the scene duration (bounded between 0.5 and 2 seconds). It runs YOLOv10 on sampled frames and saves the first frame plus frames where the detected object set changes. The saved keyframes are then processed by the ingestion worker:
+FFmpeg samples frames at 0.5 FPS. The sampled frame index is converted back to an approximate absolute video timestamp during indexing.
 
-- **YOLOv10** records object names, confidence scores, and bounding boxes.
-- **EasyOCR** reads visible text. Non-empty OCR results receive a 384-dimensional Sentence Transformer embedding and a BM25 sparse vector.
-- **CLIP ViT-B/32** creates a normalized 512-dimensional image embedding. The detected object labels are also represented with a BM25 sparse vector.
+### 3. Visual analysis
 
-Each record includes the video ID and a timestamp derived from the frame filename. Visual frame records go to `video_frames`; explicit OCR records go to `video_ocr`.
+For each sampled frame:
 
-### 4. Speech transcription and scene semantics
+- **CLIP** creates a normalized 512-dimensional image vector.
+- **YOLOv10** detects objects and stores their labels, confidence values, and bounding boxes.
+- **EasyOCR** extracts visible text. OCR text is embedded with the same 384-dimensional Sentence Transformer used for speech.
 
-Each scene chunk is converted to 16 kHz mono WAV and passed to Faster-Whisper (the `base` model in the current application startup configuration). The transcript is embedded with `all-MiniLM-L6-v2` (384 dimensions) and with the Qdrant BM25 sparse model. The resulting records are stored in `video_transcripts`, with chunk start/end times and transcript text in the payload.
+Visual and OCR records are stored separately so text found inside a frame can be searched independently from its image representation.
 
-The same video chunk is passed to VideoMAE, which samples 16 frames uniformly and predicts its top five Kinetics action labels. Those labels are joined into text, embedded, and stored in `video_scene_semantics`.
+### 4. Speech and action analysis
 
-A JSON transcript cache is also written to `storage/processed/<video_id>/transcripts/transcript.json`.
+Each scene clip is passed to FFmpeg to extract 16 kHz mono audio. Faster-Whisper transcribes the clip; Sentence Transformers creates a 384-dimensional embedding for the transcript.
 
-### 5. Vector storage
+When action recognition is enabled, VideoMAE samples 16 frames from the clip and predicts its top action labels. If VideoMAE cannot initialize, the API logs the issue and continues without action indexing.
 
-Qdrant is configured with four collections:
+### 5. Dense and sparse indexing
 
-| Collection | Dense vector | Sparse vector | Payload purpose |
-|---|---:|---|---|
-| `video_frames` | `clip`: 512 dimensions | `bm25` | Frame timestamp, detected objects, OCR text, raw detections |
-| `video_transcripts` | `dense`: 384 dimensions | `bm25` | Transcript text and chunk time range |
-| `video_ocr` | `dense`: 384 dimensions | `bm25` | Recognized on-screen text and frame timestamp |
-| `video_scene_semantics` | `dense`: 384 dimensions | `bm25` | Action labels and chunk time range |
+Every searchable record has a dense semantic vector and a BM25 sparse vector. Payloads include the video ID and timestamps so retrieval can filter to one video and reconstruct a local timeline.
 
-The Qdrant manager creates a collection when it cannot find it and provides methods to upsert each record type.
+## How search and chat work
 
-## Retrieval and ranking
+1. The optional **agent planner** asks Ollama to rewrite the user's message as a concise search query. If Ollama is unavailable, the original message is used.
+2. The retriever creates CLIP text, Sentence Transformer, and BM25 query vectors.
+3. Each Qdrant collection is searched independently with a mandatory `video_id` filter.
+4. Dense and sparse rankings are fused per collection, then the channel rankings are fused with RRF.
+5. The engine loads nearby transcript, OCR, visual, and action evidence from Qdrant.
+6. Ollama receives the evidence and must answer from that evidence, citing timestamps. If retrieval returns no evidence, the engine does **not** ask the LLM to guess.
 
-A natural-language query is encoded in three ways:
+The chat engine keeps a small in-memory session state to maintain a current timestamp for follow-up questions. Session history can also be supplied by the client.
 
-1. **CLIP text embedding** (512 dimensions) for matching visual frames.
-2. **Sentence Transformer embedding** (384 dimensions) for matching transcript, OCR, and action text.
-3. **BM25 sparse embedding** for lexical matching of words and phrases.
+## Models and vector collections
 
-The retriever searches each applicable collection using dense and sparse vectors, with a `video_id` filter so results belong to the requested video. It first fuses the dense and sparse rankings within each channel, then combines the channel rankings.
+| Component | Model / implementation | Purpose | Vector size |
+|---|---|---|---:|
+| Visual encoder | `openai/clip-vit-base-patch32` | Image and text-to-image retrieval | 512 |
+| Object detector | `yolov10n.pt` via Ultralytics YOLO | Object labels and bounding boxes | Sparse BM25 |
+| OCR | EasyOCR (`en`) | Text visible in frames | 384 + sparse |
+| Speech | Faster-Whisper (`base` by default) | Speech transcription | — |
+| Text encoder | `sentence-transformers/all-MiniLM-L6-v2` | Transcript, OCR, action semantics | 384 |
+| Action classifier | `MCG-NJU/videomae-base-finetuned-kinetics` | Clip-level action labels | 384 + sparse |
+| Sparse encoder | `Qdrant/bm25` via FastEmbed | Lexical matching | Sparse |
 
-The fusion method is **Reciprocal Rank Fusion (RRF)**. For a result at rank `r`, a channel contributes approximately:
+Qdrant collections:
 
-`weight / (k + r)`
+| Collection | Dense vector name | Payload highlights |
+|---|---|---|
+| `video_frames` | `clip` (512) | `video_id`, `timestamp`, `detected_objects`, `ocr_text`, detections |
+| `video_transcripts` | `dense` (384) | `video_id`, `start_time`, `end_time`, transcript `text` |
+| `video_ocr` | `dense` (384) | `video_id`, `timestamp`, OCR `text` |
+| `video_scene_semantics` | `dense` (384) | `video_id`, `start_time`, `end_time`, `semantic_text` |
 
-where `k` defaults to 60. This lets rankings from different embedding spaces be combined without assuming their raw similarity scores are directly comparable. The current final channel weights favor scene/action semantics (1.4) and visual frames (1.2), with transcript and OCR channels at 1.0.
+All four collections also have a named `bm25` sparse vector.
 
-The retriever also provides `get_temporal_context()`, which scrolls the four collections for indexed evidence inside a time window around a selected timestamp, deduplicates it, and returns it in chronological order.
-
-## Conversational layer
-
-There are two agent/chat implementations in the repository:
-
-- **`core/chat_engine.py` — currently wired into the API.** It gathers retrieval context, builds a system prompt that asks Llama 3 to answer only from that evidence, includes chat history, and extracts timestamp markers from the answer to maintain an active moment in an in-memory session.
-- **`core/lang.py` — LangGraph-based implementation.** It defines a richer state machine for classifying user intent (new search, follow-up, temporal follow-up, clarification, summary, or out-of-scope), retrieving hits, deciding whether to select a result or ask the user to choose, and maintaining conversational state. **It is not imported by `main.py` in the current branch**, so its graph is not the chat flow currently exposed by the API.
-- **`core/agent.py` — query planning helper.** It asks a local Ollama Llama 3 model to turn a raw request into an optimized query, target channels, and an optional time filter, with a fallback plan if the LLM is unavailable. It is initialized by `main.py`, but the current `core/chat_engine.py` implementation does not call its planning method.
-
-The active chat sessions are stored in the Python process memory in `main.py`. They are not durable across server restarts and are not shared across multiple API workers.
-
-## Repository tour
-
-Every tracked source/configuration file in the current repository is described below.
+## Repository structure
 
 | Path | Responsibility |
 |---|---|
-| `main.py` | FastAPI application, model initialization/lifespan, request schemas, upload endpoint, background ingestion worker, silence-aware chunk splitting, multimodal indexing, chat endpoint, and session cleanup endpoint. This is the main application entry point. |
-| `core/__init__.py` | Package marker for the `core` Python package. Currently empty. |
-| `core/agent.py` | Defines the Pydantic `QueryPlan` and `AgenticQueryEngine`; calls Ollama to structure a natural-language search request and falls back to a default plan. |
-| `core/audio_processor.py` | Initializes Faster-Whisper and `all-MiniLM-L6-v2`; extracts chunk audio with FFmpeg; transcribes speech and creates dense text embeddings. |
-| `core/chat_engine.py` | Active chat engine imported by `main.py`; retrieves context, assembles prompts/history, calls Ollama, and updates the active timestamp in session state. |
-| `core/detector.py` | Loads YOLOv10 weights (downloads them if absent), selects CUDA/CPU, and returns detected object labels, confidence values, and bounding boxes for an image. |
-| `core/embedder.py` | Loads CLIP ViT-B/32 and its processor; converts an image frame into a normalized 512-dimensional embedding. |
-| `core/ingestion.py` | Manages raw/processed storage directories; extracts audio and frames; detects scene changes; slices scene clips; samples frames and saves keyframes when object detections change. |
-| `core/lang.py` | Separate LangGraph-based conversational workflow with intent classification, retrieval, confidence handling, clarification options, temporal context, and response generation. Not currently connected to the API entry point. |
-| `core/ocr.py` | Wraps EasyOCR and returns recognized text from an image. |
-| `core/retriever.py` | Creates query embeddings, searches Qdrant dense and sparse vectors across all four collections, applies RRF ranking fusion, and fetches timestamp-local context. |
-| `core/scene.py` | Loads VideoMAE, decodes video chunks with PyAV, samples 16 frames, and predicts top-k action labels. |
-| `core/vector_db.py` | Connects to Qdrant, creates the four vector collections with their named dense/sparse vector configurations, and upserts indexed points. |
-| `config/config.py` | Empty placeholder; no settings are currently defined or loaded from this module. |
-| `requirements.txt` | Current pinned Python dependency list. It does not yet include every package imported by the application; see [Current implementation notes](#current-implementation-notes). |
-| `docker-compose.yml` | Defines an API container and a Qdrant container, ports, storage mounts, and a named Qdrant volume. Its API build depends on a Dockerfile that is currently empty/mis-cased (see notes). |
-| `DockerFile` | Empty file. It currently does not provide a usable container build definition. |
-| `.gitignore` | Currently ignores only `storage/`. |
-| `yolov10n.pt` | YOLOv10n model weights checked into the repository; the detector can also download weights if the expected file is missing. |
-| `__pycache__/`, `core/__pycache__/` | Checked-in Python bytecode caches. These are generated artifacts, not application source, and normally should not be committed. |
+| `main.py` | FastAPI application, lifespan/model initialization, upload endpoint, background ingestion, Qdrant writes, ingestion status, chat/session endpoints |
+| `config/config.py` | Environment-backed settings; keeps configuration centralized |
+| `core/ingestion.py` | FFmpeg duration probing, scene-boundary detection, bounded clip creation, frame sampling, workspace management |
+| `core/embedder.py` | CLIP image preprocessing and normalized frame embeddings |
+| `core/detector.py` | YOLO object detection and normalized detection output |
+| `core/ocr.py` | EasyOCR wrapper with CPU/GPU selection |
+| `core/audio_processor.py` | Per-clip audio extraction, Faster-Whisper transcription, Sentence Transformer embeddings |
+| `core/scene.py` | VideoMAE frame sampling and action-label inference |
+| `core/vector_db.py` | Qdrant connection, collection/index creation, batched upserts |
+| `core/retriever.py` | Video-filtered dense/sparse search, RRF fusion, temporal context lookup |
+| `core/agent.py` | Optional Ollama query planner and safe fallback to the original query |
+| `core/chat_engine.py` | Evidence-grounded chat, timestamp context, safe no-evidence response, session continuity |
+| `tests/` | Unit tests for retrieval fusion, chat evidence handling, and ingestion workspace creation |
+| `requirements.txt` | Python runtime dependencies |
+| `.env.example` | Documented environment-variable defaults |
+| `Dockerfile` | Reproducible Python/FFmpeg API image |
+| `docker-compose.yml` | API, Qdrant, and Ollama services |
+| `.dockerignore` / `.gitignore` | Excludes runtime data, model weights, caches, and local secrets |
 
-## Technology stack
+The previous unused alternate LangGraph chat implementation was removed so there is one active chat path. The downloaded YOLO checkpoint and committed Python bytecode caches were also removed from version control; Ultralytics can obtain the configured checkpoint when first needed.
 
-| Technology | Role |
-|---|---|
-| Python | Application and pipeline implementation |
-| FastAPI, Uvicorn, Pydantic | HTTP API, ASGI server, and request validation |
-| FFmpeg / FFprobe | Audio extraction, frame extraction, scene detection, and video slicing |
-| Qdrant | Vector database and metadata storage |
-| CLIP (OpenAI `clip-vit-base-patch32`) | Image and text-in-CLIP-space embeddings |
-| Sentence Transformers (`all-MiniLM-L6-v2`) | Dense embeddings for transcript, OCR, and action text |
-| FastEmbed (`Qdrant/bm25`) | Sparse lexical retrieval vectors |
-| Faster-Whisper | Speech-to-text transcription |
-| Ultralytics YOLOv10 | Object detection |
-| EasyOCR | On-screen text recognition |
-| VideoMAE / PyTorch / Transformers | Video action recognition and model inference |
-| Ollama / Llama 3 | Local LLM query planning and conversational responses |
-| HTTPX | Async HTTP calls to Ollama |
-| PyAV | Video decoding for VideoMAE |
-| Pydub | Silence detection for long audio/video chunk splitting |
-| LangGraph | Alternative conversational state graph in `core/lang.py` |
+## Requirements
 
-## Requirements and setup
+- Python 3.11 recommended.
+- FFmpeg and FFprobe available on `PATH`.
+- Qdrant (local Docker or remote instance).
+- Ollama with the configured chat model pulled.
+- Internet access on first startup to download model weights/tokenizers.
+- Enough RAM/VRAM for the selected models. CPU fallback is supported, but model loading and video processing can be slow.
+- CUDA is optional. Set `MODEL_DEVICE=auto` to select CUDA when available, otherwise CPU.
 
-### System requirements
+## Run locally
 
-- Python environment compatible with the pinned packages and the installed PyTorch build.
-- FFmpeg and FFprobe available on the system `PATH`.
-- A running Qdrant instance.
-- Ollama installed and running locally, with the `llama3` model available.
-- A CUDA-capable GPU is strongly expected by the current startup code: `main.py` explicitly initializes Faster-Whisper and the Sentence Transformer with `device="cuda"`. The detector, OCR, CLIP, and VideoMAE components contain some CPU fallback logic, but that does not make the complete current startup CPU-safe.
+### 1. Install system tools
 
-### Install Python dependencies
-
-The checked-in `requirements.txt` is incomplete relative to the imports in the source. It currently lists FastAPI, Uvicorn, multipart, Pydantic, PyTorch, Transformers, Pillow, and Qdrant Client, but the code also imports packages such as Faster-Whisper, Sentence Transformers, Ultralytics, EasyOCR, FastEmbed, HTTPX, PyAV, Pydub, and NumPy.
-
-Start with the repository's pinned requirements, then install the missing runtime packages in versions compatible with your Python/PyTorch/CUDA environment:
+Install FFmpeg (including FFprobe) using your operating system's package manager and verify:
 
 ```bash
-python -m venv .venv
+ffmpeg -version
+ffprobe -version
+```
 
-# macOS / Linux
+### 2. Create an environment and install Python dependencies
+
+```bash
+python3.11 -m venv .venv
+# Linux/macOS
 source .venv/bin/activate
-
 # Windows PowerShell
 # .venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install faster-whisper sentence-transformers ultralytics easyocr fastembed httpx av pydub numpy
 ```
 
-Install the correct PyTorch build for your CUDA runtime by following the [official PyTorch installation selector](https://pytorch.org/get-started/locally/). The command above is a starting point, not a tested lockfile for every GPU/CUDA combination.
+For NVIDIA acceleration, install a PyTorch build compatible with your installed CUDA runtime before installing the remaining dependencies. Consult the official PyTorch installation selector for the exact command for your platform.
 
-### Start Qdrant
-
-For a local development instance, one option is:
+### 3. Configure services
 
 ```bash
-docker run --name qdrant \
-  -p 6333:6333 -p 6334:6334 \
-  -v qdrant_storage:/qdrant/storage \
-  qdrant/qdrant:latest
+cp .env.example .env
 ```
 
-The application connects to `localhost:6333` by default.
+Start Qdrant:
 
-### Start Ollama
+```bash
+docker run -d --name video-engine-qdrant \
+  -p 6333:6333 -p 6334:6334 \
+  -v qdrant_data:/qdrant/storage \
+  qdrant/qdrant:v1.13.2
+```
 
-Install Ollama, start its local service, and pull the model used by the code:
+Install and start Ollama, then pull the configured model:
 
 ```bash
 ollama pull llama3
 ollama serve
 ```
 
-The application expects Ollama at `http://localhost:11434`.
-
-## Running the API
-
-After the external services and Python dependencies are installed:
+### 4. Start the API
 
 ```bash
 python main.py
 ```
 
-The application starts Uvicorn on `127.0.0.1:8000`. FastAPI's interactive API documentation is available at:
+Open the interactive API documentation at [http://localhost:8000/docs](http://localhost:8000/docs). The API listens on `0.0.0.0:8000` by default.
 
-- Swagger UI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- ReDoc: [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
+## Run with Docker Compose
 
-The model initialization happens in the FastAPI lifespan handler. The first startup can take time while models and weights are loaded.
+```bash
+cp .env.example .env
+docker compose up --build -d
+docker compose logs -f api
+```
+
+Pull the Ollama model once the Ollama service is running:
+
+```bash
+docker compose exec ollama ollama pull llama3
+```
+
+Then open [http://localhost:8000/docs](http://localhost:8000/docs).
+
+The first API startup downloads several large model checkpoints and may take a while. To reduce memory usage, set `ENABLE_SCENE_RECOGNITION=false` in `.env` before starting the stack. The Docker image uses CPU-oriented defaults; GPU-enabled containers require a host NVIDIA driver, NVIDIA Container Toolkit, and a CUDA-compatible PyTorch/runtime setup.
 
 ## API reference
 
-### Upload a video
+### `GET /health`
 
-`POST /ingest`
+Simple process health check.
 
-Content type: `multipart/form-data`
+Example response:
 
-Form field: `file` (MP4, AVI, MOV, or MKV).
+```json
+{"status":"ok","service":"multimodal-video-search"}
+```
 
-Example:
+### `POST /ingest`
+
+Multipart form upload with a field named `file`.
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/ingest" \
-  -F "file=@./sample.mp4"
+curl -X POST http://localhost:8000/ingest \
+  -F "file=@./sample-video.mp4"
 ```
 
 Example response:
@@ -297,91 +285,78 @@ Example response:
 ```json
 {
   "status": "queued",
-  "video_id": "generated-video-uuid",
-  "message": "Video uploaded. Pipelines running in background."
+  "video_id": "generated-uuid",
+  "status_url": "/ingest/generated-uuid"
 }
 ```
 
-The response means the background task was queued; it does not mean indexing has completed. Keep the returned `video_id` for subsequent requests.
+### `GET /ingest/{video_id}`
 
-### Chat with an indexed video
+Poll ingestion state. Possible values are `queued`, `processing`, `completed`, and `failed`. Completed responses include counts for frames, OCR records, transcript chunks, and action records. Job status is in memory and is lost if the API process restarts.
 
-`POST /api/v1/chat`
+### `POST /api/v1/chat`
 
-JSON body:
+Request:
 
 ```json
 {
-  "video_id": "generated-video-uuid",
-  "message": "What happens when the car appears?",
-  "session_id": "client-generated-session-id",
+  "video_id": "generated-uuid",
+  "message": "What does the person pick up?",
+  "session_id": "client-generated-or-server-default",
   "history": []
 }
 ```
 
-- `video_id`: ID returned by `POST /ingest`.
-- `message`: question about the video.
-- `session_id`: client-generated ID reused for turns in the same conversation.
-- `history`: optional list of prior `{ "role": "...", "content": "..." }` messages.
+`session_id` is optional; the server generates one when omitted. Reuse the same ID for turns in the same conversation. Supply recent history as `[{ "role": "user", "content": "..." }, { "role": "assistant", "content": "..." }]`.
 
-The response includes `response`, `session_id`, `needs_user_input`, `options`, `query_plan`, and a small `session_state` summary.
+The response contains `response`, `session_id`, `needs_user_input`, `options`, `query_plan`, and a compact `session_state`.
 
-### Clear a chat session
+### `DELETE /api/v1/chat/session/{session_id}`
 
-`DELETE /api/v1/chat/session/{session_id}`
+Clear in-memory session state when the conversation ends.
 
-Removes that session's in-memory state from the API process.
+## Configuration
 
-## Storage layout
+Copy `.env.example` to `.env`. Main settings:
 
-The ingestion pipeline creates a layout similar to:
+| Variable | Default | Description |
+|---|---|---|
+| `APP_HOST` | `0.0.0.0` | API bind address |
+| `APP_PORT` | `8000` | API port |
+| `STORAGE_DIR` | `./storage` | Upload and processed-video workspace |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
+| `OLLAMA_MODEL` | `llama3` | Chat/planner model |
+| `WHISPER_MODEL` | `base` | Faster-Whisper checkpoint |
+| `MODEL_DEVICE` | `auto` | `auto`, `cpu`, or CUDA device |
+| `ENABLE_SCENE_RECOGNITION` | `true` | Enable VideoMAE action labels |
+| `MAX_UPLOAD_BYTES` | `2147483648` | Maximum upload size (2 GiB) |
+| `MAX_VIDEO_CHUNK_SECONDS` | `30` | Maximum scene clip duration |
+| `RETRIEVAL_LIMIT` | `5` | Number of fused retrieval results |
 
-```text
-storage/
-├── raw/
-│   └── <video-id>.<extension>
-└── processed/
-    └── <video-id>/
-        ├── audio/
-        │   └── audio.wav
-        ├── chunks/
-        │   └── scene_<start>_to_<end>.mp4
-        ├── frames/
-        │   └── chunk_<start>_<end>_frame<n>.jpg
-        └── transcripts/
-            └── transcript.json
+In Docker Compose, the API connects to the service names `qdrant` and `ollama`; locally, the defaults use `localhost`.
+
+## Tests
+
+Run the unit tests from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
-The original video and intermediate files are stored locally. Search vectors and their payload metadata are stored in Qdrant. The `storage/` directory is ignored by Git.
+The tests cover RRF grouping (including the second fusion stage), video-scoped chat retrieval/evidence fallback, refusal to call the LLM when there is no evidence, and ingestion workspace creation. They do not download models, launch Qdrant/Ollama, process real media, or replace an end-to-end smoke test.
 
-## Current implementation notes
+## Operational notes and limitations
 
-These are important details observed in the current source tree and should be addressed before treating the project as a reliable deployable service:
-
-1. **The active chat path appears to have a retrieval-call mismatch.** `core/retriever.py` defines `search(video_id, query, ...)`, requiring a `video_id`. The active `core/chat_engine.py` calls it with only `query` and `limit`. That call raises a missing-argument error, which is caught and converted into an empty context. As a result, the active chat engine may answer without retrieved video evidence until the call is corrected.
-2. **The active chat engine does not use the agent planner.** `main.py` initializes `AgenticQueryEngine` and passes it into `AgenticVideoChatEngine`, but `core/chat_engine.py` does not invoke it. The richer LangGraph flow in `core/lang.py` is separate and is not wired into the API.
-3. **The declared requirements are incomplete.** Several imported packages are absent from `requirements.txt`; a clean environment using only that file will not be sufficient.
-4. **The Docker build is not ready.** `docker-compose.yml` specifies `build: .`, but the repository contains an empty `DockerFile` (capital F), not a usable standard `Dockerfile`. The compose API service therefore needs a real Dockerfile and a consistent filename before it can build.
-5. **The API service's Compose command/configuration should be verified.** The compose file currently does not define an explicit startup command, and the Python app hardcodes Qdrant and Ollama at `localhost`. Inside a container, `localhost` refers to that API container, not the Qdrant/Ollama services. Container networking and service hostnames need to be configured.
-6. **GPU selection is not fully configurable.** The current startup passes `device="cuda"` to `AudioProcessor`; CPU-only deployments need a configurable device and compatible Whisper compute type.
-7. **Chat session state is in memory.** Sessions disappear on restart and are not shared between multiple workers or replicas.
-8. **Ingestion completion is not tracked by an API status endpoint.** The upload endpoint returns `queued`; clients currently have no dedicated endpoint to check indexing progress or errors.
-9. **Generated files are tracked.** Python `__pycache__` files and the YOLO weights file are in the repository. Consider ignoring bytecode/model artifacts and distributing large model weights through a documented download step or model storage.
-10. **Configuration is hardcoded.** `config/config.py` is empty; hostnames, ports, model names, and device choices are currently embedded in Python files.
-
-These notes are included so contributors can distinguish the intended architecture from what the current branch actually wires together.
-
-## Potential next steps
-
-- Fix and test the chat-to-retriever call, and connect the LangGraph workflow or remove/clearly separate the unused path.
-- Add an ingestion job status store and an endpoint for progress, completion, and failure reporting.
-- Move model names, service URLs, storage paths, and device settings into environment-backed configuration.
-- Complete `requirements.txt` with tested compatible versions and add a lockfile.
-- Add a working `Dockerfile`, container-aware Qdrant/Ollama URLs, health checks, and a documented Compose workflow.
-- Add automated tests for scene chunking, timestamp extraction, vector payloads, RRF ranking, and API contracts.
-- Add sample screenshots/API examples and a small, redistributable test video.
-- Add a proper `.gitignore` for Python caches, local environments, generated storage, and downloaded model artifacts.
+- **Model startup is intentionally explicit.** The FastAPI lifespan loads models once. If a large model cannot load, startup may fail; action recognition alone is optional and degrades gracefully.
+- **CPU is supported but slower.** CLIP, OCR, Whisper, YOLO, and VideoMAE can consume substantial RAM and CPU time.
+- **Ollama is a runtime dependency for generated answers.** If it is unavailable, query planning falls back to the raw user query and chat returns a clear model-unavailable message after evidence retrieval.
+- **Job/session state is in memory.** The current FastAPI background-task and session dictionaries are suitable for a single-process demo, not durable production workloads. Use a task queue and persistent session/job store before scaling to multiple workers or replicas.
+- **No authentication is included.** Do not expose this API directly to the public internet without authentication, authorization, rate limiting, and upload scanning.
+- **Qdrant must retain its volume.** Deleting the Qdrant volume deletes the indexed vectors.
+- **First-run downloads are large.** Cache model files on persistent storage and plan for several GB of disk space.
+- **No real-video end-to-end run is claimed by the unit tests.** Verify the full workflow with representative videos and your target hardware before production use.
 
 ## License
 
-No license file is currently present in the repository. Until a license is added, reuse and redistribution permissions are not explicitly granted. Add a `LICENSE` file if you intend to publish the project for open-source reuse.
+No license file is currently included. Add a license before redistributing or accepting external contributions under explicit terms.

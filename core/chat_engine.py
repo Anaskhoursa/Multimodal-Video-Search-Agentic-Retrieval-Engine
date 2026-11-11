@@ -49,8 +49,9 @@ class AgenticVideoChatEngine:
             return ""
 
     async def _fetch_video_context(self, video_id: str, query: str,
-                                   active_chunk: dict | None = None) -> tuple[list[dict], list[dict]]:
-        hits = self.retriever.search(video_id=video_id, query=query, limit=self.top_k)
+                                   active_chunk: dict | None = None,
+                                   weights: dict[str, float] | None = None) -> tuple[list[dict], list[dict]]:
+        hits = self.retriever.search(video_id=video_id, query=query, limit=self.top_k, weights=weights)
         if active_chunk and active_chunk.get("timestamp") is not None:
             entries = self.retriever.get_temporal_context(
                 video_id=video_id, center_timestamp=float(active_chunk["timestamp"]),
@@ -65,8 +66,6 @@ class AgenticVideoChatEngine:
             )
             if entries:
                 return hits, entries
-            # Search hits themselves carry payload text. Use that evidence rather than
-            # incorrectly telling the caller that retrieval returned nothing.
             fallback = []
             for hit in hits:
                 for item in hit.get("evidence", []):
@@ -87,14 +86,21 @@ class AgenticVideoChatEngine:
         active_chunk = session.get("active_chunk")
         plan = None
         retrieval_query = message
+        retrieval_weights = None
         if self.agent_engine is not None:
             try:
                 plan = await self.agent_engine.plan_search(message)
                 retrieval_query = plan.optimized_query or message
+                channels = {"frames", "transcripts", "ocr", "actions"}
+                selected = set(plan.target_channels) & channels
+                if selected:
+                    retrieval_weights = {name: (1.0 if name in selected else 0.0) for name in channels}
             except Exception:
                 log.exception("Agentic query planning failed; using the original query")
 
-        hits, entries = await self._fetch_video_context(video_id, retrieval_query, active_chunk)
+        hits, entries = await self._fetch_video_context(
+            video_id, retrieval_query, active_chunk, retrieval_weights
+        )
         if not entries:
             response = (
                 "I couldn't find indexed evidence for that question in this video. "

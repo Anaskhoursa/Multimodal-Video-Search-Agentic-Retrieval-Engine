@@ -118,8 +118,8 @@ Every searchable record has a dense semantic vector and a BM25 sparse vector. Pa
 
 ## How search and chat work
 
-1. The optional **agent planner** asks Ollama to rewrite the user's message as a concise search query. If Ollama is unavailable, the original message is used.
-2. The retriever creates CLIP text, Sentence Transformer, and BM25 query vectors.
+1. The optional **agent planner** asks Ollama to rewrite the user's message as a concise search query and select relevant channels (frames, transcripts, OCR, and/or actions). If Ollama is unavailable, the original message is used and all channels remain eligible.
+2. The retriever searches only the selected channels and creates the required CLIP text, Sentence Transformer, and BM25 query vectors.
 3. Each Qdrant collection is searched independently with a mandatory `video_id` filter.
 4. Dense and sparse rankings are fused per collection, then the channel rankings are fused with RRF.
 5. The engine loads nearby transcript, OCR, visual, and action evidence from Qdrant.

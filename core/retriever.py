@@ -24,9 +24,6 @@ class MultimodalRetriever:
             self.device = "cpu"
         self.models = models
         self.client = QdrantClient(url=qdrant_url or settings.qdrant_url)
-
-        # Reuse the ingestion models when supplied to avoid loading a second
-        # CLIP, Sentence Transformer, and BM25 model into GPU/RAM.
         self.text_model = text_embedder or SentenceTransformer(
             text_model or settings.text_embedding_model, device=self.device
         )
@@ -56,7 +53,6 @@ class MultimodalRetriever:
     @staticmethod
     def rrf_fusion(ranked_lists: dict[str, list[Any]], k: int = 60,
                    weights: dict[str, float] | None = None) -> list[dict]:
-        """Fuse raw Qdrant points or already-fused channel results."""
         weights = weights or {}
         fused: dict[tuple[str, float], dict] = {}
         for stream, results in ranked_lists.items():
@@ -138,12 +134,21 @@ class MultimodalRetriever:
         dense_clip = self._clip_vector(query)
         sparse = self._sparse_vector(query)
         channel_weights = weights or {"frames": 1.2, "transcripts": 1.0, "ocr": 1.0, "actions": 1.4}
-        channel_results = {
-            "frames": self._search_collection("video_frames", "clip", dense_clip, sparse, video_id, limit * 2, 1.2, 1.0),
-            "transcripts": self._search_collection("video_transcripts", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
-            "ocr": self._search_collection("video_ocr", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
-            "actions": self._search_collection("video_scene_semantics", "dense", dense_text, sparse, video_id, limit * 2, 1.0, 1.2),
+        channel_specs = {
+            "frames": ("video_frames", "clip", dense_clip, 1.2, 1.0),
+            "transcripts": ("video_transcripts", "dense", dense_text, 1.0, 1.2),
+            "ocr": ("video_ocr", "dense", dense_text, 1.0, 1.2),
+            "actions": ("video_scene_semantics", "dense", dense_text, 1.0, 1.2),
         }
+        channel_results = {}
+        for channel, (collection, vector_name, dense, dense_weight, sparse_weight) in channel_specs.items():
+            if channel_weights.get(channel, 1.0) <= 0:
+                channel_results[channel] = []
+                continue
+            channel_results[channel] = self._search_collection(
+                collection, vector_name, dense, sparse, video_id, limit * 2,
+                dense_weight, sparse_weight,
+            )
         return self.rrf_fusion(channel_results, weights=channel_weights)[:limit]
 
     def get_temporal_context(self, video_id: str, center_timestamp: float,

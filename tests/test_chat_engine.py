@@ -11,8 +11,8 @@ class FakeRetriever:
         self.entries = entries or []
         self.calls = []
 
-    def search(self, video_id, query, limit):
-        self.calls.append((video_id, query, limit))
+    def search(self, video_id, query, limit, weights=None):
+        self.calls.append((video_id, query, limit, weights))
         return self.hits
 
     def get_temporal_context(self, video_id, center_timestamp, window_seconds):
@@ -23,12 +23,13 @@ class FakePlanner:
     async def plan_search(self, message):
         return SimpleNamespace(
             optimized_query="optimized query",
-            model_dump=lambda: {"optimized_query": "optimized query"},
+            target_channels=["transcripts"],
+            model_dump=lambda: {"optimized_query": "optimized query", "target_channels": ["transcripts"]},
         )
 
 
 class ChatEngineTests(unittest.TestCase):
-    def test_passes_video_id_and_uses_hit_evidence(self):
+    def test_passes_video_id_and_agent_channel_route(self):
         retriever = FakeRetriever(hits=[{
             "video_id": "video-1", "timestamp": 8.0,
             "evidence": [{"stream": "transcript", "text": "a car turns left"}],
@@ -38,6 +39,8 @@ class ChatEngineTests(unittest.TestCase):
         result = asyncio.run(engine.execute_chat("video-1", "what happens?", [], {}))
         self.assertEqual(retriever.calls[0][0], "video-1")
         self.assertEqual(retriever.calls[0][1], "optimized query")
+        self.assertEqual(retriever.calls[0][3]["transcripts"], 1.0)
+        self.assertEqual(retriever.calls[0][3]["frames"], 0.0)
         self.assertIn("car turns left", result["response"])
         engine._ask_ollama.assert_awaited_once()
 
